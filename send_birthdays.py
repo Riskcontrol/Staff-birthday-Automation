@@ -2,36 +2,28 @@
 """
 send_birthdays.py
 
-- Downloads an Excel workbook from SHAREPOINT_URL (if provided) and reads staff birthdays.
-  Falls back to ./birthdays.csv if download or parsing fails.
-- Sends a single plain-text email reminder to HR for birthdays in these windows:
-    10 days, 5 days, 2 days, same day (0)
-- Environment variables:
-    GMAIL_USER         (required) Gmail address to send from
-    GMAIL_APP_PASSWORD (required) App password for the Gmail account
-    HR_EMAIL           (optional) defaults to hr@riskcontrolnigeria.com
-    TZ                 (optional) timezone name (IANA), defaults to Africa/Lagos
-    SHAREPOINT_URL     (optional) direct-download link to the Excel workbook
+- Downloads the staff birthday workbook from SHAREPOINT_URL if set
+- Falls back to birthdays.csv if download fails
+- Sends a plain-text birthday reminder email for the 10, 5, 2, and same-day windows
 """
 import csv
 import datetime
+import io
 import os
 import re
 import smtplib
 import sys
 import tempfile
-import requests
-import shutil
 from collections import defaultdict
 from email.message import EmailMessage
 
+import requests
+
 try:
-    # Python 3.9+
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
 
-# Optional dependency: pandas + openpyxl
 try:
     import pandas as pd
 except Exception:
@@ -50,7 +42,7 @@ def normalize_date_str(s: str) -> str:
     if not s:
         return ""
     s = s.strip()
-    s = ORDINAL_RE.sub(r"\1", s)          # remove ordinal suffixes
+    s = ORDINAL_RE.sub(r"\1", s)
     s = s.replace(",", " ")
     s = re.sub(r"\s+of\s+", " ", s, flags=re.IGNORECASE)
     s = " ".join(s.split())
@@ -58,7 +50,6 @@ def normalize_date_str(s: str) -> str:
 
 
 def parse_day_month(s: str):
-    """Returns (day:int, month:int) or None"""
     s = normalize_date_str(s)
     for fmt in ("%d %B", "%d %b", "%B %d", "%b %d", "%d-%B", "%d/%B"):
         try:
@@ -86,62 +77,42 @@ def today_date():
     tz_name = os.environ.get("TZ", "Africa/Lagos")
     if ZoneInfo:
         try:
-            now = datetime.datetime.now(ZoneInfo(tz_name))
-            return now.date()
+            return datetime.datetime.now(ZoneInfo(tz_name)).date()
         except Exception:
             return datetime.datetime.utcnow().date()
-    else:
-        return datetime.datetime.utcnow().date()
+    return datetime.datetime.utcnow().date()
 
 
-def download_sharepoint_excel(url: str, timeout: int = 30) -> str:
-    """
-    Download the file at `url` (streaming) into a temporary file and return the local path.
-    Raises requests.HTTPError on failure.
-    """
+def download_sharepoint_excel(url: str, timeout: int = 30):
     if not url:
-        raise ValueError("No URL provided")
-    resp = requests.get(url, stream=True, timeout=timeout)
-    resp.raise_for_status()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-    tmp_path = tmp.name
-    tmp.close()
-    with requests.get(url, stream=True, timeout=timeout) as r:
-        r.raise_for_status()
-        with open(tmp_path, "wb") as f:
-            shutil.copyfileobj(r.raw, f)
+        raise ValueError("SHAREPOINT_URL is empty")
+
+    # Try direct download
+    response = requests.get(url, allow_redirects=True, timeout=timeout)
+    print("SharePoint HTTP status:", response.status_code)
+    print("SharePoint Content-Type:", response.headers.get("Content-Type"))
+    print("SharePoint final URL:", response.url)
+
+    if response.status_code != 200:
+        raise RuntimeError(f"SharePoint URL returned status {response.status_code}")
+
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "html" in content_type or "text/plain" in content_type:
+        raise RuntimeError(
+            "URL did not return an Excel file. It likely returned an HTML login page or SharePoint landing page."
+        )
+
+    if "excel" not in content_type and "octet-stream" not in content_type and "xlsx" not in content_type and "zip" not in content_type:
+        # still allow it in case the URL is returning a valid file with a generic content type
+        print("Warning: unexpected content type for an Excel file. Continuing anyway.")
+
+    # Save binary content to temp file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        tmp.write(response.content)
+        tmp_path = tmp.name
+
+    print(f"Saved workbook to: {tmp_path}")
     return tmp_path
-
-
-def read_birthdays_from_excel(path: str):
-    """
-    Read the first sheet of an Excel file and map columns to expected keys.
-    Returns list of dicts with keys: sn, name, designation, dob
-    """
-    if pd is None:
-        raise RuntimeError("pandas is required to read Excel files. Install pandas and openpyxl.")
-    df = pd.read_excel(path, engine="openpyxl")
-    # Normalize columns
-    cols = {c.strip().lower(): c for c in df.columns}
-    def col_by_candidates(candidates):
-        for cand in candidates:
-            cand = cand.strip().lower()
-            if cand in cols:
-                return cols[cand]
-        return None
-    sn_col = col_by_candidates(["s/n", "sn", "s n", "serial"])
-    name_col = col_by_candidates(["names", "name", "employee", "full name"])
-    desig_col = col_by_candidates(["designation", "role", "job title", "position"])
-    dob_col = col_by_candidates(["date of birth", "dob", "birthdate", "date"])
-    rows = []
-    for _, row in df.iterrows():
-        rows.append({
-            "sn": _ if sn_col is None else row.get(sn_col),
-            "name": "" if name_col is None else str(row.get(name_col)).strip(),
-            "designation": "" if desig_col is None else str(row.get(desig_col)).strip(),
-            "dob": "" if dob_col is None else str(row.get(dob_col)).strip()
-        })
-    return rows
 
 
 def read_birthdays_from_csv(csv_path=CSV_PATH):
@@ -155,6 +126,42 @@ def read_birthdays_from_csv(csv_path=CSV_PATH):
                 "designation": (r.get("DESIGNATION") or "").strip(),
                 "dob": (r.get("DATE OF BIRTH") or "").strip()
             })
+    return rows
+
+
+def read_birthdays_from_excel(path: str):
+    if pd is None:
+        raise RuntimeError("pandas/openpyxl not installed")
+
+    # Parse from bytes directly to avoid file issues
+    with open(path, "rb") as f:
+        data = f.read()
+
+    df = pd.read_excel(io.BytesIO(data), engine="openpyxl", dtype=str, keep_default_na=False)
+    print("Excel columns detected:", list(df.columns))
+
+    # normalize column names
+    normalized = {str(c).strip().lower(): c for c in df.columns}
+    def find_col(*names):
+        for n in names:
+            key = str(n).strip().lower()
+            if key in normalized:
+                return normalized[key]
+        return None
+
+    sn_col = find_col("s/n", "sn", "s n", "serial")
+    name_col = find_col("names", "name", "full name", "employee name")
+    desig_col = find_col("designation", "role", "job title", "position")
+    dob_col = find_col("date of birth", "dob", "date", "birth date")
+
+    rows = []
+    for _, row in df.iterrows():
+        rows.append({
+            "sn": "" if sn_col is None else str(row.get(sn_col, "")).strip(),
+            "name": "" if name_col is None else str(row.get(name_col, "")).strip(),
+            "designation": "" if desig_col is None else str(row.get(desig_col, "")).strip(),
+            "dob": "" if dob_col is None else str(row.get(dob_col, "")).strip()
+        })
     return rows
 
 
@@ -185,8 +192,10 @@ def build_email_body(grouped: dict, for_date: datetime.date):
         lines.append("Regards,")
         lines.append("Birthday Automation")
         return "\n".join(lines)
+
     lines.append(f"There are {total} staff with birthdays in the next configured windows:")
     lines.append("")
+
     for window in sorted(VALID_WINDOWS, reverse=True):
         items = grouped.get(window, [])
         if not items:
@@ -207,6 +216,7 @@ def build_email_body(grouped: dict, for_date: datetime.date):
                 nb_str = m["dob"]
             lines.append(f"- {m['name']} — {m['designation']} (DOB: {m['dob']}) — Next: {nb_str}")
         lines.append("")
+
     lines.append("Please join in wishing them well.")
     lines.append("")
     lines.append("Regards,")
@@ -220,6 +230,7 @@ def send_email(subject, body, from_addr, to_addrs, smtp_user, smtp_pass):
     msg["From"] = from_addr
     msg["To"] = ", ".join(to_addrs) if isinstance(to_addrs, (list, tuple)) else to_addrs
     msg.set_content(body)
+
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT_SSL, timeout=30) as server:
         server.login(smtp_user, smtp_pass)
         server.send_message(msg)
@@ -236,65 +247,62 @@ def main():
         sys.exit(0)
 
     rows = []
-    # Try Excel from SharePoint first (if provided)
+
     if sharepoint_url:
-        print("SHAREPOINT_URL provided — attempting to download Excel...")
+        print("Attempting to use SHAREPOINT_URL")
         try:
-            path = download_sharepoint_excel(sharepoint_url)
-            print(f"Downloaded Excel to {path}; parsing...")
-            rows = read_birthdays_from_excel(path)
-            print(f"Parsed {len(rows)} rows from Excel.")
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+            workbook_path = download_sharepoint_excel(sharepoint_url)
+            rows = read_birthdays_from_excel(workbook_path)
+            print(f"Parsed {len(rows)} rows from SharePoint workbook.")
+            os.remove(workbook_path)
         except Exception as e:
-            print("Failed to download or parse Excel from SHAREPOINT_URL:", str(e))
-            print("Falling back to local CSV if available.")
+            print("Excel download/parse failed:", str(e))
+            print("Falling back to local CSV...")
             try:
                 rows = read_birthdays_from_csv(CSV_PATH)
-                print(f"Parsed {len(rows)} rows from CSV.")
+                print(f"Parsed {len(rows)} rows from CSV fallback.")
             except FileNotFoundError:
                 print(f"{CSV_PATH} not found. Exiting.")
-                sys.exit(0)
+                sys.exit(1)
     else:
-        # No sharepoint URL — use CSV
         try:
             rows = read_birthdays_from_csv(CSV_PATH)
             print(f"Parsed {len(rows)} rows from CSV.")
         except FileNotFoundError:
             print(f"{CSV_PATH} not found and SHAREPOINT_URL not set. Exiting.")
-            sys.exit(0)
+            sys.exit(1)
 
     today = today_date()
     grouped = defaultdict(list)
+
     for r in rows:
-        parsed = parse_day_month(r.get("dob") or "")
+        dob = (r.get("dob") or "").strip()
+        parsed = parse_day_month(dob)
         if not parsed:
             continue
         day, month = parsed
         delta = days_until_next_birthday(day, month, today)
-        if delta is None:
-            continue
         if delta in VALID_WINDOWS:
             grouped[delta].append(r)
 
     if not any(grouped.values()):
-        print(f"No birthdays within {sorted(VALID_WINDOWS)} days of {today.isoformat()}. Nothing to send.")
+        print(f"No birthdays in the configured windows for {today.isoformat()}.")
         return
 
     subject_parts = []
     for w in sorted(grouped.keys()):
         label = "Same day" if w == 0 else f"{w}d"
         subject_parts.append(f"{len(grouped[w])} x {label}")
+
     subject = f"Birthday Reminder — {' | '.join(subject_parts)} — {today.strftime('%d %b %Y')}"
     body = build_email_body(grouped, today)
 
     try:
         send_email(subject, body, gmail_user, [hr_email], gmail_user, gmail_pass)
-        print(f"Sent birthday reminder to {hr_email} for windows: {', '.join(str(k) for k in sorted(grouped.keys()))}.")
+        print(f"Sent reminder to {hr_email}")
     except Exception as e:
         print("Failed to send email:", str(e))
+        raise
 
 
 if __name__ == "__main__":
